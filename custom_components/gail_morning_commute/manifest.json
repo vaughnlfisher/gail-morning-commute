@@ -1,0 +1,13 @@
+{
+  "domain": "gail_morning_commute",
+  "name": "Gail Morning Commute",
+  "version": "1.0.0",
+  "description": "Gail morning commute: Twyford→Ealing Broadway (Elizabeth line) → Ealing Broadway→Hammersmith (District line).",
+  "documentation": "https://github.com/vaughnlfisher/gail-morning-commute",
+  "issue_tracker": "https://github.com/vaughnlfisher/gail-morning-commute/issues",
+  "dependencies": [],
+  "codeowners": ["@vaughnlfisher"],
+  "requirements": [],
+  "iot_class": "cloud_polling",
+  "config_flow": true
+}
