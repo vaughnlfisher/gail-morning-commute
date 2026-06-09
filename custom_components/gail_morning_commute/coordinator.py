@@ -215,7 +215,9 @@ class GailMorningCoordinator(DataUpdateCoordinator):
             now = datetime.now().astimezone()
 
             leg1_services = await self._fetch_leg(LEG1_FROM, LEG1_TO)
-            leg2_services = await self._fetch_leg(LEG2_FROM, LEG2_TO)
+            # leg2 (EAL→HMM) is District/Piccadilly TfL — not in Darwin/Huxley.
+            # We show static interchange note; EAL→HMM is ~6 min, freq every 2-3 min peak.
+            EAL_TO_HMM_MINS = 6
 
             # Leg 1: Twyford → Ealing Broadway (Elizabeth line eastbound)
             leg1 = _upcoming(leg1_services, now, EASTBOUND_TERMINI)
@@ -229,34 +231,24 @@ class GailMorningCoordinator(DataUpdateCoordinator):
                     l1_arr = l1["dt"] + timedelta(minutes=25)
                     l1_transit = 25
 
-                board2 = l1_arr + timedelta(minutes=EALING_INTERCHANGE_MINS)
-                leg2_opts = []
-                for l2 in _upcoming(leg2_services, board2, HAMMERSMITH_TERMINI):
-                    _, l2_transit = _arrival_at(l2["_svc"], ["hammersmith"], l2["dt"])
-                    if l2_transit is None:
-                        l2_transit = 10
-                    wait2 = max(0, round((l2["dt"] - l1_arr).total_seconds() / 60))
-                    total = (l1_transit or 0) + (l2_transit or 0)
-                    leg2_opts.append({
-                        "time": l2["time"],
-                        "destination": l2["destination"],
-                        "status": l2["status"],
-                        "delay_minutes": l2["delay_minutes"],
-                        "platform": l2["platform"],
-                        "operator": l2["operator"],
-                        "operator_code": l2["operator_code"],
-                        "wait_mins": wait2,
-                        "transit_mins": l2_transit,
-                        "total_transit_mins": total,
-                    })
-                    if len(leg2_opts) >= MAX_LEG2:
-                        break
+                # EAL→HMM: static estimate — District/Piccadilly, ~2-3 min wait + 6 min journey
+                eal_dep = l1_arr + timedelta(minutes=EALING_INTERCHANGE_MINS)
+                eal_arr_hmm = eal_dep + timedelta(minutes=EAL_TO_HMM_MINS)
+                total_transit = (l1_transit or 0) + EALING_INTERCHANGE_MINS + EAL_TO_HMM_MINS
 
-                total_transit = None
-                if leg2_opts:
-                    total_transit = leg2_opts[0].get("total_transit_mins")
-                elif l1_transit is not None:
-                    total_transit = l1_transit
+                leg2_opts = [{
+                    "time": eal_dep.strftime("%H:%M"),
+                    "destination": "Hammersmith",
+                    "status": "TfL",
+                    "delay_minutes": None,
+                    "platform": None,
+                    "operator": "District / Piccadilly line",
+                    "operator_code": "LU",
+                    "wait_mins": EALING_INTERCHANGE_MINS,
+                    "transit_mins": EAL_TO_HMM_MINS,
+                    "total_transit_mins": total_transit,
+                    "tfl_static": True,
+                }]
 
                 trains.append({
                     "time": l1["time"],
