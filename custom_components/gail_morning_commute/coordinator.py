@@ -15,9 +15,10 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
-    DOMAIN, NUM_TRAINS, MAX_LEG2,
+    DOMAIN, DARWIN_TOKEN, NUM_TRAINS, MAX_LEG2,
     SCAN_INTERVAL_PEAK, SCAN_INTERVAL_OFFPEAK, SCAN_INTERVAL_NIGHT,
     EALING_INTERCHANGE_MINS,
+    HUXLEY_ROWS,
     LEG1_HISTORY_PROXY_ENTITY, LEG2_HISTORY_PROXY_ENTITY,
     TFL_APP_KEY, TFL_JOURNEY_URL, NAPTAN_EALING_BROADWAY, NAPTAN_HAMMERSMITH,
 )
@@ -28,6 +29,11 @@ _LOGGER = logging.getLogger(__name__)
 TWY_ELIZABETH = "sensor.london_tfl_elizabeth_910gtwyford"   # leg1 TWY → EAL (eastbound)
 EAL_DISTRICT  = "sensor.london_tfl_district_940gzzlueby"    # leg2 EAL → HMM (eastbound District)
 
+HUXLEY_DEP = (
+    "https://huxley2.azurewebsites.net/departures/{frm}/to/{to}/{rows}"
+    "?expand=true&accessToken={token}"
+)
+HUXLEY_ROWS = 25
 EAL_TRANSIT_MINS = 25   # TWY → EAL on Elizabeth line
 HMM_TRANSIT_MINS = 6    # EAL → HMM on District line
 
@@ -128,6 +134,58 @@ class GailMorningCoordinator(DataUpdateCoordinator):
         return out
 
 
+
+    async def _fetch_huxley(self, frm, to):
+        """Fetch departures from Huxley (Darwin) for full train detail."""
+        url = HUXLEY_DEP.format(frm=frm, to=to, rows=HUXLEY_ROWS, token=DARWIN_TOKEN)
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+                    if resp.status != 200:
+                        _LOGGER.warning("Huxley %s->%s HTTP %s", frm, to, resp.status)
+                        return []
+                    data = await resp.json(content_type=None)
+                    return data.get("trainServices") or []
+        except Exception as err:
+            _LOGGER.warning("Huxley %s->%s error: %s", frm, to, err)
+            return []
+
+    @staticmethod
+    def _extract_calling_points(svc):
+        """Extract calling point names from Huxley subsequentCallingPoints."""
+        scp = svc.get("subsequentCallingPoints")
+        if not scp or not isinstance(scp, list):
+            return []
+        pts = scp[0].get("callingPoint", []) if isinstance(scp[0], dict) else []
+        return [p.get("locationName", "") for p in pts if p.get("locationName")]
+
+    @staticmethod
+    def _svc_dest(svc):
+        dest = svc.get("destination") or []
+        if isinstance(dest, list) and dest:
+            return dest[0].get("locationName", "")
+        return str(dest)
+
+    @staticmethod
+    def _svc_status(svc):
+        etd = (svc.get("etd") or "").strip()
+        if etd == "Cancelled":
+            return "Cancelled", None
+        if etd in ("On time", ""):
+            return "On time", 0
+        if etd == "Delayed":
+            return "Delayed", None
+        std = (svc.get("std") or "").strip()
+        try:
+            eh, em = map(int, etd.split(":"))
+            sh, sm = map(int, std.split(":"))
+            delay = (eh * 60 + em) - (sh * 60 + sm)
+            if delay < 0:
+                delay += 1440
+            return ("On time" if delay == 0 else "Delayed"), delay
+        except (ValueError, TypeError):
+            return "On time", 0
+
     async def _fetch_journey(self, frm, to, depart_dt):
         """Call the TfL Journey Planner for real timetabled connections.
 
@@ -181,11 +239,38 @@ class GailMorningCoordinator(DataUpdateCoordinator):
     async def _async_update_data(self) -> dict:
         self.update_interval = _get_scan_interval()
         try:
-            # Leg 1: TWY → EAL (Elizabeth line eastbound). Exclude designation "3" = Reading (westbound).
-            twy = self._tfl_departures(
-                TWY_ELIZABETH,
-                filter_fn=lambda d: (d.get("line") or {}).get("designation") != "3",
-            )
+            # Leg 1: TWY → EAL via Huxley (Darwin) for full train detail (calling points, platform, operator).
+            twy_raw = await self._fetch_huxley("TWY", "EAL")
+            now_local = datetime.now().astimezone()
+            twy = []
+            for svc in twy_raw:
+                std = (svc.get("std") or "").strip()
+                if not std or std in ("Delayed", "Cancelled"):
+                    continue
+                try:
+                    h, m = map(int, std.split(":"))
+                    dt = now_local.replace(hour=h, minute=m, second=0, microsecond=0)
+                    if (dt - now_local).total_seconds() < -3600:
+                        dt += timedelta(days=1)
+                    if dt < now_local:
+                        continue
+                except (ValueError, TypeError):
+                    continue
+                status, delay = self._svc_status(svc)
+                twy.append({
+                    "dt": dt,
+                    "destination": self._svc_dest(svc),
+                    "status": status,
+                    "delay_minutes": delay,
+                    "platform": svc.get("platform"),
+                    "operator": svc.get("operator"),
+                    "operator_code": svc.get("operatorCode"),
+                    "calling_points": self._extract_calling_points(svc),
+                    "delay_reason": svc.get("delayReason"),
+                    "cancel_reason": svc.get("cancelReason"),
+                    "_raw": svc,
+                })
+            twy.sort(key=lambda x: x["dt"])
             # Leg 2: EAL → HMM via the TfL Journey Planner (real timetabled tube connections).
             trains = []
             for l1 in twy[:NUM_TRAINS]:
@@ -220,12 +305,15 @@ class GailMorningCoordinator(DataUpdateCoordinator):
 
                 trains.append({
                     "time": _hhmm(l1_dt),
-                    "destination": l1["destination"] or "London",
-                    "status": "On time",
-                    "delay_minutes": 0,
-                    "platform": None,
-                    "operator": "Elizabeth Line",
-                    "operator_code": "XR",
+                    "destination": l1.get("destination") or "London",
+                    "status": l1.get("status", "On time"),
+                    "delay_minutes": l1.get("delay_minutes", 0),
+                    "platform": l1.get("platform"),
+                    "operator": l1.get("operator", "Elizabeth Line"),
+                    "operator_code": l1.get("operator_code", "XR"),
+                    "calling_points": l1.get("calling_points", []),
+                    "delay_reason": l1.get("delay_reason"),
+                    "cancel_reason": l1.get("cancel_reason"),
                     "transit_mins": EAL_TRANSIT_MINS,
                     "total_transit_mins": total,
                     "leg2": leg2,

@@ -1,7 +1,7 @@
-// Gail Morning Commute Card v2.0.0
+// Gail Morning Commute Card v2.2.0
 // 2-leg: Twyford->Ealing Broadway (Elizabeth) -> Ealing Broadway->Hammersmith (District)
 
-const VER = '2.0.0';
+const VER = '2.2.0';
 
 function carrierLabel(opCode, operator) {
   if (!opCode && !operator) return '';
@@ -140,6 +140,11 @@ class GailMorningCommuteCard extends HTMLElement {
       const cc = carrierColor(item.operator_code, item.operator);
       if (cl) carrierBadge = `<span class="carrier" style="background:${cc}">${cl}</span>`;
     }
+    const callHtml = (item.calling_points && item.calling_points.length)
+      ? `<div class="calling">Calling at: ${item.calling_points.slice(0,4).join(', ')}${item.calling_points.length > 4 ? ` +${item.calling_points.length - 4} more` : ''}</div>` : '';
+    const delayHtml = item.delay_reason ? `<div class="delay-reason">\u26a0 ${item.delay_reason}</div>` : '';
+    const cancelHtml = item.cancel_reason ? `<div class="delay-reason">\u2715 ${item.cancel_reason}</div>` : '';
+    const opHtml = item.operator ? `<div class="operator">${item.operator}</div>` : '';
     return `<div class="row ${cls}">
       <div class="top">
         <span class="time" style="color:${color}">${item.time}</span>
@@ -147,6 +152,7 @@ class GailMorningCommuteCard extends HTMLElement {
         <span class="status" style="color:${color}">${lbl}</span>
       </div>
       <div class="sub">Towards ${item.destination}</div>
+      ${opHtml}${callHtml}${delayHtml}${cancelHtml}
     </div>`;
   }
 
