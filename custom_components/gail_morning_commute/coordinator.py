@@ -8,6 +8,8 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta, timezone
 
+import aiohttp
+
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
@@ -17,6 +19,7 @@ from .const import (
     SCAN_INTERVAL_PEAK, SCAN_INTERVAL_OFFPEAK, SCAN_INTERVAL_NIGHT,
     EALING_INTERCHANGE_MINS,
     LEG1_HISTORY_PROXY_ENTITY, LEG2_HISTORY_PROXY_ENTITY,
+    TFL_APP_KEY, TFL_JOURNEY_URL, NAPTAN_EALING_BROADWAY, NAPTAN_HAMMERSMITH,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -124,6 +127,57 @@ class GailMorningCoordinator(DataUpdateCoordinator):
         out.sort(key=lambda x: x["dt"])
         return out
 
+
+    async def _fetch_journey(self, frm, to, depart_dt):
+        """Call the TfL Journey Planner for real timetabled connections.
+
+        Returns a list of dicts: time, destination(line summary), arrival, duration, wait.
+        depart_dt is the earliest departure (Gail's interchange-ready time).
+        """
+        url = TFL_JOURNEY_URL.format(frm=frm, to=to)
+        params = {
+            "mode": "tube",
+            "timeIs": "Departing",
+            "date": depart_dt.strftime("%Y%m%d"),
+            "time": depart_dt.strftime("%H%M"),
+            "app_key": TFL_APP_KEY,
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url, params=params, headers={"Accept": "application/json"},
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status != 200:
+                        _LOGGER.warning("TfL Journey %s->%s HTTP %s", frm, to, resp.status)
+                        return []
+                    data = await resp.json(content_type=None)
+        except Exception as err:
+            _LOGGER.warning("TfL Journey %s->%s error: %s", frm, to, err)
+            return []
+
+        out = []
+        for jn in (data.get("journeys") or []):
+            start = _parse_dt(jn.get("startDateTime"))
+            arr = _parse_dt(jn.get("arrivalDateTime"))
+            if not start:
+                continue
+            legs = jn.get("legs") or []
+            lines = []
+            for lg in legs:
+                ro = (lg.get("routeOptions") or [{}])
+                nm = ro[0].get("name") if ro else None
+                if nm and nm not in lines:
+                    lines.append(nm)
+            out.append({
+                "dt": start,
+                "arr": arr,
+                "duration": jn.get("duration"),
+                "lines": lines,
+            })
+        out.sort(key=lambda x: x["dt"])
+        return out
+
     async def _async_update_data(self) -> dict:
         self.update_interval = _get_scan_interval()
         try:
@@ -132,40 +186,37 @@ class GailMorningCoordinator(DataUpdateCoordinator):
                 TWY_ELIZABETH,
                 filter_fn=lambda d: (d.get("line") or {}).get("designation") != "3",
             )
-            # Leg 2: EAL → HMM. Ealing Broadway is the District line western terminus;
-            # the TfL feed reports destination as the terminus ("Ealing Broadway") and only
-            # ~15 min ahead, so live time-matching for a connection 25+ min out is unreliable.
-            # District/Piccadilly run every ~3 min, so synthesise connections from the
-            # interchange time onward (still rendered in the standard leg2 row structure).
-            EAL_FREQ_MINS = 3
-            eal = self._tfl_departures(EAL_DISTRICT)  # kept for future use / availability check
-
+            # Leg 2: EAL → HMM via the TfL Journey Planner (real timetabled tube connections).
             trains = []
             for l1 in twy[:NUM_TRAINS]:
                 l1_dt = l1["dt"]
                 eal_arr = l1_dt + timedelta(minutes=EAL_TRANSIT_MINS)
                 board_after = eal_arr + timedelta(minutes=EALING_INTERCHANGE_MINS)
 
+                journeys = await self._fetch_journey(
+                    NAPTAN_EALING_BROADWAY, NAPTAN_HAMMERSMITH, board_after
+                )
                 leg2 = []
-                for n in range(MAX_LEG2):
-                    dep = board_after + timedelta(minutes=n * EAL_FREQ_MINS)
-                    wait = max(0, round((dep - eal_arr).total_seconds() / 60))
+                for jn in journeys[:MAX_LEG2]:
+                    wait = max(0, round((jn["dt"] - eal_arr).total_seconds() / 60))
+                    line_summary = " + ".join(jn["lines"]) if jn["lines"] else "District / Piccadilly"
                     leg2.append({
-                        "time": _hhmm(dep),
-                        "destination": "Hammersmith",
+                        "time": _hhmm(jn["dt"]),
+                        "destination": f"Hammersmith ({line_summary})",
                         "status": "On time",
                         "delay_minutes": 0,
                         "platform": None,
-                        "operator": "District / Piccadilly line",
+                        "operator": line_summary,
                         "operator_code": "LU",
                         "wait_mins": wait,
-                        "transit_mins": HMM_TRANSIT_MINS,
+                        "transit_mins": jn["duration"] if jn["duration"] else HMM_TRANSIT_MINS,
                     })
 
                 total = None
-                if leg2:
-                    first_l2_dt = eal_arr + timedelta(minutes=leg2[0]["wait_mins"])
-                    total = round((first_l2_dt - l1_dt).total_seconds() / 60) + HMM_TRANSIT_MINS
+                if leg2 and journeys:
+                    j0 = journeys[0]
+                    if j0.get("arr"):
+                        total = round((j0["arr"] - l1_dt).total_seconds() / 60)
 
                 trains.append({
                     "time": _hhmm(l1_dt),

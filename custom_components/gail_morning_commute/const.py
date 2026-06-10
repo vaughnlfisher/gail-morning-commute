@@ -46,3 +46,10 @@ HSP_USERNAME = "YOUR_NRE_USERNAME"
 HSP_PASSWORD = "YOUR_NRE_PASSWORD"
 LEG1_HISTORY_PROXY_ENTITY = "sensor.twyford_to_farringdon_historical_reliability"
 LEG2_HISTORY_PROXY_ENTITY = "sensor.morning_commute_leg_2_historical_reliability"
+
+# TfL Unified API (Journey Planner) — used for the tube leg with real timetabled connections
+TFL_APP_KEY = "cd8efc356eff48898163e18960ffe5da"
+TFL_JOURNEY_URL = "https://api.tfl.gov.uk/Journey/JourneyResults/{frm}/to/{to}"
+# NaPTAN stop IDs
+NAPTAN_EALING_BROADWAY = "940GZZLUEBY"
+NAPTAN_HAMMERSMITH = "940GZZLUHSD"
