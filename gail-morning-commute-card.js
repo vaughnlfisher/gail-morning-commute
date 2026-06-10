@@ -1,8 +1,7 @@
-// Gail Morning Commute Card v1.2.0
-// 3-leg return: CTK->Farringdon (Thameslink) -> Farringdon->Paddington (Elizabeth) -> Paddington->Twyford (GWR/Lizzie)
-// Anchored nesting: each leg shows connections catchable after the previous leg arrives.
+// Gail Morning Commute Card v2.0.0
+// 2-leg: Twyford->Ealing Broadway (Elizabeth) -> Ealing Broadway->Hammersmith (District)
 
-const VER = '1.2.1';
+const VER = '2.0.0';
 
 function carrierLabel(opCode, operator) {
   if (!opCode && !operator) return '';
@@ -73,19 +72,6 @@ class GailMorningCommuteCard extends HTMLElement {
     return s ? s.attributes : null;
   }
 
-  _tflDeps(entityId, filterFn) {
-    const s = this._hass?.states[entityId];
-    if (!s?.attributes?.departures) return [];
-    const now = new Date();
-    return s.attributes.departures
-      .filter(d => new Date(d.expected) > now && (!filterFn || filterFn(d)))
-      .sort((a, b) => new Date(a.expected) - new Date(b.expected));
-  }
-
-  _tflTime(dep) {
-    return new Date(dep.expected).toLocaleTimeString('en-GB', {hour:'2-digit', minute:'2-digit'});
-  }
-
   _styles() {
     return `
       :host{display:block}
@@ -103,8 +89,8 @@ class GailMorningCommuteCard extends HTMLElement {
       .caret.open{transform:rotate(180deg)}
       .carrier{border-radius:4px;padding:1px 6px;font-size:.92em;font-weight:700;color:#fff}
       .leg-pill{border-radius:10px;padding:1px 7px;font-size:9px;font-weight:800;color:#fff;text-shadow:0 1px 1px rgba(0,0,0,.35)}
-      .p1{background:#6950a1}   /* Elizabeth line purple */
-      .p2{background:#9364CC}   /* Elizabeth line purple */
+      .p1{background:#6950a1}   /* Thameslink red (deepened for contrast) */
+      .p2{background:#007D32}   /* Elizabeth line purple */
       .p3{background:#0A493E}   /* GWR dark green */
       .row{padding:8px 16px}
       .row .top{display:flex;align-items:baseline;justify-content:space-between;gap:6px}
@@ -190,7 +176,6 @@ class GailMorningCommuteCard extends HTMLElement {
   _histPanel(history) {
     const l1 = this._histSection(history.leg1, 'p1', '#6950a1');
     const l2 = this._histSection(history.leg2, 'p2', '#007D32');
-    const l3 = this._histSection(history.leg3, 'p3', '#0A493E');
     return `<div class="hist-panel-wrap">${l1}<hr class="hist-divider">${l2}</div>`;
   }
 
@@ -203,64 +188,42 @@ class GailMorningCommuteCard extends HTMLElement {
       ? new Date(s.last_updated).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })
       : null;
     const fInt = s?.ealing_interchange_mins ?? 5;
+    const pInt = s?.paddington_interchange_mins ?? 8;
 
     const hdr = cfg.show_header
       ? `<div class="hdr"><span style="font-size:20px">\ud83c\udf06</span><div><div class="hdr-title">${cfg.title}</div><div class="hdr-route">Twyford \u2192 Ealing Broadway \u2192 Hammersmith</div></div></div>`
       : '';
 
     let blocks;
-    if (false) {
-      // trains path replaced by TfL direct
+    if (!trains.length) {
+      blocks = '<div class="no-trains">No services found</div>';
     } else {
-      // TfL live sensors: leg1=Elizabeth line from TWY, leg2=District from EAL
-      const twyDeps = this._tflDeps('sensor.london_tfl_elizabeth_910gtwyford',
-        d => d.line?.designation !== '3'); // exclude designation 3 = Reading (westbound)
-      const ealDeps = this._tflDeps('sensor.london_tfl_district_940gzzlueby');
-      const EAL_TRANSIT_MINS = 25; // TWY→EAL ~25 min on Elizabeth line
-      const HMM_TRANSIT_MINS = 6;  // EAL→HMM ~6 min on District
-
-      if (!twyDeps.length) {
-        blocks = '<div class="no-trains">No Elizabeth line services from Twyford</div>';
-      } else {
-        if (!this._collapsedInit) {
-          twyDeps.slice(0,3).forEach((_, i) => { this._collapsed[i] = (i !== 0); });
-          this._collapsedInit = true;
-        }
-        blocks = twyDeps.slice(0, 3).map((l1dep, idx) => {
-          const collapsed = !!this._collapsed[idx];
-          const l1dt = new Date(l1dep.expected);
-          const l1time = this._tflTime(l1dep);
-          const l1dest = l1dep.destination || 'London';
-          const ealArr = new Date(l1dt.getTime() + EAL_TRANSIT_MINS * 60000);
-          const boardAfter = new Date(ealArr.getTime() + fInt * 60000);
-          const leg2opts = ealDeps.filter(d => new Date(d.expected) >= boardAfter).slice(0, 3);
-          const totalMins = leg2opts.length
-            ? Math.round((new Date(leg2opts[0].expected) - l1dt) / 60000) + HMM_TRANSIT_MINS
-            : null;
-          const totalTxt = totalMins ? `<span class="total-time">\u23f1 ${totalMins} min total</span>` : '';
-          const caret = `<span class="caret${collapsed ? '' : ' open'}">\u25bc</span>`;
-          const l1row = `<div class="row"><span class="dep">${l1time}</span><span class="dest">${l1dest}</span></div>`;
-          const leg1 = `<div class="leg-bar leg1-toggle" data-idx="${idx}"><span class="leg-pill p1">LEG 1</span>Twyford \u2192 Ealing Broadway \u00b7 Elizabeth line ${totalTxt}${caret}</div>${l1row}`;
-
-          if (collapsed) return `<div class="train-block">${leg1}</div>`;
-
-          let leg2html;
-          if (!leg2opts.length) {
-            leg2html = `<div class="interchange"><span class="line"></span>\ud83d\udeb6 ${fInt}m interchange at Ealing Broadway<span class="line"></span></div>`
-              + `<div class="l2-wrap"><div class="none">No District line connection yet</div></div>`;
-          } else {
-            const l2rows = leg2opts.map(l2dep => {
-              const l2time = this._tflTime(l2dep);
-              const waitMins = Math.max(0, Math.round((new Date(l2dep.expected) - ealArr) / 60000));
-              return `<div class="l2-row"><span class="dep">${l2time}</span><span class="dest">${l2dep.destination || 'Hammersmith direction'}</span><span style="font-size:.72em;color:#888">${waitMins > 0 ? waitMins + 'm wait · ' : ''}~${HMM_TRANSIT_MINS}m to HMM</span></div>`;
-            }).join('');
-            leg2html = `<div class="interchange"><span class="line"></span>\ud83d\udeb6 ${fInt}m interchange at Ealing Broadway<span class="line"></span></div>`
-              + `<div class="leg-bar"><span class="leg-pill p2">LEG 2</span>Ealing Broadway \u2192 Hammersmith \u00b7 District line</div>`
-              + `<div class="l2-wrap">${l2rows}</div>`;
-          }
-          return `<div class="train-block">${leg1}${leg2html}</div>`;
-        }).join('');
+      if (!this._collapsedInit) {
+        trains.forEach((_, i) => { this._collapsed[i] = (i !== 0); });
+        this._collapsedInit = true;
       }
+      blocks = trains.map((t, idx) => {
+        const collapsed = !!this._collapsed[idx];
+        const totalTxt = (t.total_transit_mins !== null && t.total_transit_mins !== undefined)
+          ? `<span class="total-time">\u23f1 ${t.total_transit_mins} min total</span>` : '';
+        const caret = `<span class="caret${collapsed ? '' : ' open'}">\u25bc</span>`;
+        const leg1bar = `<div class="leg-bar leg1-toggle" data-idx="${idx}"><span class="leg-pill p1">LEG 1</span>Twyford \u2192 Ealing Broadway \u00b7 Elizabeth line ${totalTxt}${caret}</div>`;
+        const leg1 = leg1bar + this._row(t, 'row');
+
+        if (collapsed) {
+          return `<div class="train-block">${leg1}</div>`;
+        }
+
+        const leg2list = Array.isArray(t.leg2) ? t.leg2 : [];
+        let leg2html;
+        if (!leg2list.length) {
+          leg2html = `<div class="interchange"><span class="line"></span>\ud83d\udeb6 ${fInt}m interchange<span class="line"></span></div><div class="l2-wrap"><div class="none">No onward District line connection yet</div></div>`;
+        } else {
+          leg2html = `<div class="interchange"><span class="line"></span>\ud83d\udeb6 ${fInt}m interchange at Ealing Broadway<span class="line"></span></div>`
+            + `<div class="leg-bar"><span class="leg-pill p2">LEG 2</span>Ealing Broadway \u2192 Hammersmith \u00b7 District line</div>`
+            + `<div class="l2-wrap">` + leg2list.map(l2 => this._row(l2, 'l2-row')).join('') + `</div>`;
+        }
+        return `<div class="train-block">${leg1}${leg2html}</div>`;
       }).join('');
     }
 
@@ -285,11 +248,11 @@ class GailMorningCommuteCard extends HTMLElement {
 }
 
 customElements.define('gail-morning-commute-card', GailMorningCommuteCard);
-window.customCards = (window.customCards || []).filter(c => c.type !== 'evening-commute-multileg-card');
+window.customCards = (window.customCards || []).filter(c => c.type !== 'gail-morning-commute-card');
 window.customCards.push({
-  type: 'evening-commute-multileg-card',
-  name: 'Evening Commute Multileg Card',
-  description: 'CTK->Farringdon->Paddington->Twyford return journey, 3-level anchored nesting',
+  type: 'gail-morning-commute-card',
+  name: 'Gail Morning Commute Card',
+  description: 'Twyford->Ealing Broadway->Hammersmith, 2-leg anchored nesting',
   preview: true,
 });
-console.info(`%c EVENING-COMMUTE-MULTILEG-CARD %c v${VER} `, 'background:#0A493E;color:#fff;font-weight:700;padding:2px 4px;border-radius:3px 0 0 3px', 'background:#9364CC;color:#fff;font-weight:700;padding:2px 4px;border-radius:0 3px 3px 0');
+console.info(`%c GAIL-MORNING-COMMUTE-CARD %c v${VER} `, 'background:#0A493E;color:#fff;font-weight:700;padding:2px 4px;border-radius:3px 0 0 3px', 'background:#9364CC;color:#fff;font-weight:700;padding:2px 4px;border-radius:0 3px 3px 0');

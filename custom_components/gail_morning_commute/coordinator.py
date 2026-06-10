@@ -1,30 +1,32 @@
-"""Coordinator for Gail Morning Commute (Twyford → Ealing Broadway → Hammersmith)."""
+"""Coordinator for Gail Morning Commute (Twyford → Ealing Broadway → Hammersmith).
+
+Reads the London TfL integration sensors directly (no Huxley/Darwin), and builds
+the same trains[].leg2[] schema that the multileg card expects.
+"""
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
-
-import aiohttp
+from datetime import datetime, timedelta, timezone
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
-    DOMAIN, DARWIN_TOKEN,
-    LEG1_FROM, LEG1_TO, LEG2_FROM, LEG2_TO,
-    EALING_INTERCHANGE_MINS, NUM_TRAINS, MAX_LEG2,
+    DOMAIN, NUM_TRAINS, MAX_LEG2,
     SCAN_INTERVAL_PEAK, SCAN_INTERVAL_OFFPEAK, SCAN_INTERVAL_NIGHT,
-    HUXLEY_ROWS, EASTBOUND_TERMINI, HAMMERSMITH_TERMINI,
+    EALING_INTERCHANGE_MINS,
     LEG1_HISTORY_PROXY_ENTITY, LEG2_HISTORY_PROXY_ENTITY,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
-HUXLEY_DEP = (
-    "https://huxley2.azurewebsites.net/departures/{frm}/to/{to}/{rows}"
-    "?expand=true&accessToken={token}"
-)
+# TfL sensor entities
+TWY_ELIZABETH = "sensor.london_tfl_elizabeth_910gtwyford"   # leg1 TWY → EAL (eastbound)
+EAL_DISTRICT  = "sensor.london_tfl_district_940gzzlueby"    # leg2 EAL → HMM (eastbound District)
+
+EAL_TRANSIT_MINS = 25   # TWY → EAL on Elizabeth line
+HMM_TRANSIT_MINS = 6    # EAL → HMM on District line
 
 
 def _get_scan_interval() -> timedelta:
@@ -36,117 +38,24 @@ def _get_scan_interval() -> timedelta:
     return timedelta(seconds=SCAN_INTERVAL_OFFPEAK)
 
 
-def _parse_hhmm_after(val, ref):
+def _parse_dt(val):
+    """Parse a TfL 'expected' ISO timestamp into an aware datetime."""
+    if not val:
+        return None
     try:
-        h, m = map(int, val.split(":"))
-        dt = ref.replace(hour=h, minute=m, second=0, microsecond=0)
-        if (dt - ref).total_seconds() < -3600:
-            dt += timedelta(days=1)
+        s = str(val).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
         return dt
-    except (ValueError, TypeError, AttributeError):
+    except (ValueError, TypeError):
         return None
 
 
-def _svc_dest(svc):
-    dest = svc.get("destination") or []
-    if isinstance(dest, list) and dest:
-        return dest[0].get("locationName", "")
-    return str(dest)
-
-
-def _svc_time(svc):
-    now = datetime.now().astimezone()
-    for key in ("etd", "std"):
-        val = (svc.get(key) or "").strip()
-        if val in ("", "Delayed", "Cancelled", "On time"):
-            continue
-        try:
-            h, m = map(int, val.split(":"))
-            dt = now.replace(hour=h, minute=m, second=0, microsecond=0)
-            if (dt - now).total_seconds() < -3600:
-                dt += timedelta(days=1)
-            return dt
-        except (ValueError, TypeError):
-            continue
-    std = (svc.get("std") or "").strip()
-    if std:
-        try:
-            h, m = map(int, std.split(":"))
-            dt = now.replace(hour=h, minute=m, second=0, microsecond=0)
-            if (dt - now).total_seconds() < -3600:
-                dt += timedelta(days=1)
-            return dt
-        except (ValueError, TypeError):
-            pass
-    return None
-
-
-def _svc_status(svc):
-    etd = (svc.get("etd") or "").strip()
-    if etd == "Cancelled":
-        return "Cancelled", None
-    if etd in ("On time", ""):
-        return "On time", 0
-    if etd == "Delayed":
-        return "Delayed", None
-    std = (svc.get("std") or "").strip()
-    try:
-        eh, em = map(int, etd.split(":"))
-        sh, sm = map(int, std.split(":"))
-        delay = (eh * 60 + em) - (sh * 60 + sm)
-        if delay < 0:
-            delay += 1440
-        return ("On time" if delay == 0 else "Delayed"), delay
-    except (ValueError, TypeError):
-        return "On time", 0
-
-
-def _arrival_at(svc, dest_names, dep_dt):
-    scp = svc.get("subsequentCallingPoints")
-    if not scp or not isinstance(scp, list):
-        return None, None
-    pts = scp[0].get("callingPoint", []) if isinstance(scp[0], dict) else []
-    for p in pts:
-        name = (p.get("locationName") or "").lower()
-        if any(d in name for d in dest_names):
-            t = (p.get("et") or "").strip()
-            if t in ("", "On time", "Delayed", "Cancelled"):
-                t = (p.get("st") or "").strip()
-            arr_dt = _parse_hhmm_after(t, dep_dt)
-            if arr_dt:
-                transit = max(0, round((arr_dt - dep_dt).total_seconds() / 60))
-                return arr_dt, transit
-            break
-    return None, None
-
-
-def _is_to(svc, termini):
-    dest = _svc_dest(svc).lower()
-    return any(kw in dest for kw in termini)
-
-
-def _upcoming(services, after_dt, termini=None):
-    out = []
-    for svc in services:
-        if termini and not _is_to(svc, termini):
-            continue
-        dt = _svc_time(svc)
-        if not dt or dt < after_dt:
-            continue
-        status, delay = _svc_status(svc)
-        out.append({
-            "dt": dt,
-            "time": dt.strftime("%H:%M"),
-            "destination": _svc_dest(svc),
-            "status": status,
-            "delay_minutes": delay,
-            "platform": svc.get("platform"),
-            "operator": svc.get("operator"),
-            "operator_code": svc.get("operatorCode"),
-            "_svc": svc,
-        })
-    out.sort(key=lambda x: x["dt"])
-    return out
+def _hhmm(dt):
+    if not dt:
+        return None
+    return dt.astimezone().strftime("%H:%M")
 
 
 class GailMorningCoordinator(DataUpdateCoordinator):
@@ -158,16 +67,15 @@ class GailMorningCoordinator(DataUpdateCoordinator):
 
     def schedule_hsp_fetch(self) -> None:
         self.hass.async_create_background_task(
-            self._async_hsp_fetch(),
-            name="gail_morning_commute_hsp_fetch",
+            self._async_history_fetch(),
+            name="gail_morning_commute_history_fetch",
         )
 
-    async def _async_hsp_fetch(self) -> None:
+    async def _async_history_fetch(self) -> None:
         import asyncio as _aio
         await _aio.sleep(30)
         try:
             result = {}
-            # Both legs are TfL — proxy from Vaughn's existing sensors
             for key, entity, label in [
                 ("leg1", LEG1_HISTORY_PROXY_ENTITY, "Twyford → Ealing Broadway (Elizabeth line)"),
                 ("leg2", LEG2_HISTORY_PROXY_ENTITY, "Ealing Broadway → Hammersmith (District line)"),
@@ -193,85 +101,93 @@ class GailMorningCoordinator(DataUpdateCoordinator):
                         self.data["summary"]["history"] = result
                     self.async_set_updated_data(self.data)
         except Exception as err:
-            _LOGGER.warning("Gail morning HSP proxy error: %s", err)
+            _LOGGER.warning("Gail morning history proxy error: %s", err)
 
-    async def _fetch_leg(self, frm: str, to: str) -> list[dict]:
-        url = HUXLEY_DEP.format(frm=frm, to=to, rows=HUXLEY_ROWS, token=DARWIN_TOKEN)
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=12)) as resp:
-                    if resp.status != 200:
-                        _LOGGER.warning("Huxley %s->%s HTTP %s", frm, to, resp.status)
-                        return []
-                    data = await resp.json(content_type=None)
-                    return data.get("trainServices") or []
-        except Exception as err:
-            _LOGGER.warning("Huxley %s->%s error: %s", frm, to, err)
+    def _tfl_departures(self, entity_id, filter_fn=None):
+        """Return upcoming TfL departures (sorted), each as a normalised dict."""
+        s = self.hass.states.get(entity_id)
+        if not s or "departures" not in s.attributes:
             return []
+        now = datetime.now(timezone.utc)
+        out = []
+        for d in s.attributes["departures"]:
+            dt = _parse_dt(d.get("expected"))
+            if not dt or dt <= now:
+                continue
+            if filter_fn and not filter_fn(d):
+                continue
+            out.append({
+                "dt": dt,
+                "destination": d.get("destination", ""),
+                "designation": (d.get("line") or {}).get("designation", ""),
+            })
+        out.sort(key=lambda x: x["dt"])
+        return out
 
     async def _async_update_data(self) -> dict:
         self.update_interval = _get_scan_interval()
         try:
-            now = datetime.now().astimezone()
-
-            leg1_services = await self._fetch_leg(LEG1_FROM, LEG1_TO)
-            # leg2 (EAL→HMM) is District/Piccadilly TfL — not in Darwin/Huxley.
-            # We show static interchange note; EAL→HMM is ~6 min, freq every 2-3 min peak.
-            EAL_TO_HMM_MINS = 6
-
-            # Leg 1: Twyford → Ealing Broadway (Elizabeth line eastbound)
-            leg1 = _upcoming(leg1_services, now, EASTBOUND_TERMINI)
-            if not leg1:
-                leg1 = _upcoming(leg1_services, now)
+            # Leg 1: TWY → EAL (Elizabeth line eastbound). Exclude designation "3" = Reading (westbound).
+            twy = self._tfl_departures(
+                TWY_ELIZABETH,
+                filter_fn=lambda d: (d.get("line") or {}).get("designation") != "3",
+            )
+            # Leg 2: EAL → HMM (District line eastbound — all departures pass through HMM)
+            eal = self._tfl_departures(EAL_DISTRICT)
 
             trains = []
-            for l1 in leg1[:NUM_TRAINS]:
-                l1_arr, l1_transit = _arrival_at(l1["_svc"], ["ealing broadway"], l1["dt"])
-                if l1_arr is None:
-                    l1_arr = l1["dt"] + timedelta(minutes=25)
-                    l1_transit = 25
+            for l1 in twy[:NUM_TRAINS]:
+                l1_dt = l1["dt"]
+                eal_arr = l1_dt + timedelta(minutes=EAL_TRANSIT_MINS)
+                board_after = eal_arr + timedelta(minutes=EALING_INTERCHANGE_MINS)
 
-                # EAL→HMM: static estimate — District/Piccadilly, ~2-3 min wait + 6 min journey
-                eal_dep = l1_arr + timedelta(minutes=EALING_INTERCHANGE_MINS)
-                eal_arr_hmm = eal_dep + timedelta(minutes=EAL_TO_HMM_MINS)
-                total_transit = (l1_transit or 0) + EALING_INTERCHANGE_MINS + EAL_TO_HMM_MINS
+                leg2 = []
+                for l2 in eal:
+                    if l2["dt"] < board_after:
+                        continue
+                    wait = max(0, round((l2["dt"] - eal_arr).total_seconds() / 60))
+                    leg2.append({
+                        "time": _hhmm(l2["dt"]),
+                        "destination": l2["destination"] or "Hammersmith",
+                        "status": "On time",
+                        "delay_minutes": 0,
+                        "platform": None,
+                        "operator": "District line",
+                        "operator_code": "LU",
+                        "wait_mins": wait,
+                        "transit_mins": HMM_TRANSIT_MINS,
+                    })
+                    if len(leg2) >= MAX_LEG2:
+                        break
 
-                leg2_opts = [{
-                    "time": eal_dep.strftime("%H:%M"),
-                    "destination": "Hammersmith",
-                    "status": "TfL",
-                    "delay_minutes": None,
-                    "platform": None,
-                    "operator": "District / Piccadilly line",
-                    "operator_code": "LU",
-                    "wait_mins": EALING_INTERCHANGE_MINS,
-                    "transit_mins": EAL_TO_HMM_MINS,
-                    "total_transit_mins": total_transit,
-                    "tfl_static": True,
-                }]
+                total = None
+                if leg2:
+                    first_l2_dt = eal_arr + timedelta(minutes=leg2[0]["wait_mins"])
+                    total = round((first_l2_dt - l1_dt).total_seconds() / 60) + HMM_TRANSIT_MINS
 
                 trains.append({
-                    "time": l1["time"],
-                    "destination": l1["destination"],
-                    "status": l1["status"],
-                    "delay_minutes": l1["delay_minutes"],
-                    "platform": l1["platform"],
-                    "operator": l1["operator"],
-                    "operator_code": l1["operator_code"],
-                    "transit_mins": l1_transit,
-                    "total_transit_mins": total_transit,
-                    "leg2": leg2_opts,
+                    "time": _hhmm(l1_dt),
+                    "destination": l1["destination"] or "London",
+                    "status": "On time",
+                    "delay_minutes": 0,
+                    "platform": None,
+                    "operator": "Elizabeth Line",
+                    "operator_code": "XR",
+                    "transit_mins": EAL_TRANSIT_MINS,
+                    "total_transit_mins": total,
+                    "leg2": leg2,
                 })
 
             data = {
                 "summary": {
                     "state": trains[0]["time"] if trains else "No service",
-                    "leg1_from": LEG1_FROM,
-                    "leg1_to": LEG1_TO,
-                    "leg2_to": LEG2_TO,
+                    "leg1_from": "TWY",
+                    "leg1_to": "EAL",
+                    "leg2_to": "HMM",
                     "ealing_interchange_mins": EALING_INTERCHANGE_MINS,
+                    "farringdon_interchange_mins": EALING_INTERCHANGE_MINS,
                     "trains": trains,
-                    "last_updated": now.isoformat(),
+                    "last_updated": datetime.now().astimezone().isoformat(),
                     "history": self._history,
                 },
                 "history": self._history,
