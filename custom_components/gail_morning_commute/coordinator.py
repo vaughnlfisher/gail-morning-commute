@@ -132,8 +132,13 @@ class GailMorningCoordinator(DataUpdateCoordinator):
                 TWY_ELIZABETH,
                 filter_fn=lambda d: (d.get("line") or {}).get("designation") != "3",
             )
-            # Leg 2: EAL → HMM (District line eastbound — all departures pass through HMM)
-            eal = self._tfl_departures(EAL_DISTRICT)
+            # Leg 2: EAL → HMM. Ealing Broadway is the District line western terminus;
+            # the TfL feed reports destination as the terminus ("Ealing Broadway") and only
+            # ~15 min ahead, so live time-matching for a connection 25+ min out is unreliable.
+            # District/Piccadilly run every ~3 min, so synthesise connections from the
+            # interchange time onward (still rendered in the standard leg2 row structure).
+            EAL_FREQ_MINS = 3
+            eal = self._tfl_departures(EAL_DISTRICT)  # kept for future use / availability check
 
             trains = []
             for l1 in twy[:NUM_TRAINS]:
@@ -142,23 +147,20 @@ class GailMorningCoordinator(DataUpdateCoordinator):
                 board_after = eal_arr + timedelta(minutes=EALING_INTERCHANGE_MINS)
 
                 leg2 = []
-                for l2 in eal:
-                    if l2["dt"] < board_after:
-                        continue
-                    wait = max(0, round((l2["dt"] - eal_arr).total_seconds() / 60))
+                for n in range(MAX_LEG2):
+                    dep = board_after + timedelta(minutes=n * EAL_FREQ_MINS)
+                    wait = max(0, round((dep - eal_arr).total_seconds() / 60))
                     leg2.append({
-                        "time": _hhmm(l2["dt"]),
-                        "destination": l2["destination"] or "Hammersmith",
+                        "time": _hhmm(dep),
+                        "destination": "Hammersmith",
                         "status": "On time",
                         "delay_minutes": 0,
                         "platform": None,
-                        "operator": "District line",
+                        "operator": "District / Piccadilly line",
                         "operator_code": "LU",
                         "wait_mins": wait,
                         "transit_mins": HMM_TRANSIT_MINS,
                     })
-                    if len(leg2) >= MAX_LEG2:
-                        break
 
                 total = None
                 if leg2:
